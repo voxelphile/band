@@ -8,3 +8,5 @@ edition = "2021"
 [dependencies]
 derive_more = "0.99.17"
 crossbeam = "*"
+itertools = "*"
+band_proc_macro = { path = "./band_proc_macro" }

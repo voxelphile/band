@@ -2,17 +2,23 @@
 #![allow(dead_code)]
 #![feature(return_position_impl_trait_in_trait, fn_traits)]
 
+pub use band_proc_macro::*;
 use core::slice;
 use crossbeam::channel::*;
 use derive_more::*;
+use itertools::*;
 use std::{
     any::{type_name, TypeId},
     arch,
     collections::{BTreeSet, HashMap, HashSet, VecDeque},
+    convert::identity,
+    error::Error,
+    hint::black_box,
     iter,
     marker::PhantomData,
     mem, ptr,
-    time::{Instant, Duration}, hint::black_box, error::Error, thread::{JoinHandle, self}, convert::identity,
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 pub type Identifier = usize;
@@ -134,6 +140,7 @@ pub struct DataInfo {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deref, DerefMut, Default)]
 pub struct Archetype(Vec<DataId>);
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Access {
     Ref(DataId),
     Mut(DataId),
@@ -144,9 +151,7 @@ impl Access {
         use Access::*;
         match (self, other) {
             (Ref(_), Ref(_)) => false,
-            (Ref(x), Mut(y)) |
-            (Mut(x), Ref(y)) |
-            (Mut(x), Mut(y)) => x == y,
+            (Ref(x), Mut(y)) | (Mut(x), Ref(y)) | (Mut(x), Mut(y)) => x == y,
         }
     }
 }
@@ -266,9 +271,37 @@ impl Storage {
     }
 }
 
-pub trait Bundle: Into<Vec<ComponentPack>> {}
+pub trait Bundle {
+    fn into_component_packs(self) -> Vec<ComponentPack>;
+}
 
-impl<T: Into<Vec<ComponentPack>>> Bundle for T {}
+macro_rules! impl_bundle {
+    ($($items:ident),*) => {
+        #[allow(non_snake_case)]
+        impl<$($items: Component),*> Bundle for ($($items),*,)
+        {
+            fn into_component_packs(self) -> Vec<ComponentPack> {
+                let infos =
+                vec![
+                    $($items::info()),*
+                ];
+                let ($($items),*,) = self;
+                let data = vec![
+                    $(Box::new($items) as Box<dyn Component>),*
+                ];
+                infos.into_iter().zip(data.into_iter()).map(|(info, data)| ComponentPack(info, data)).collect()
+            }
+        }
+
+        impl_bundle!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_bundle!($($tail),*);
+    };
+    (@ $head:ident) => {};
+}
+
+impl_bundle!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
 pub enum Command {
     Spawn(Vec<ComponentPack>),
@@ -281,10 +314,11 @@ pub struct Commands {
 
 impl Commands {
     fn spawn(&self, bundle: impl Bundle) {
-        self.tx.send(Command::Spawn(bundle.into()));
+        self.tx.send(Command::Spawn(bundle.into_component_packs()));
     }
     fn insert(&self, entity: Entity, bundle: impl Bundle) {
-        self.tx.send(Command::Insert(entity, bundle.into()));
+        self.tx
+            .send(Command::Insert(entity, bundle.into_component_packs()));
     }
 }
 
@@ -328,7 +362,7 @@ impl Registry {
         self.mapping.insert(entity, Archetype::default());
         entity
     }
-    fn insert(&mut self, entity: Entity, bundle: Vec<ComponentPack>) {
+    fn insert(&mut self, entity: Entity, mut bundle: Vec<ComponentPack>) {
         self.return_storage();
 
         let Some(mut archetype) = self.mapping.remove(&entity) else {
@@ -350,17 +384,16 @@ impl Registry {
             self.data_info.insert(*id, *info);
         }
 
-        for ComponentPack(info, boxed_component) in bundle {
-            let DataInfo { id, .. } = info;
-            let position = archetype.iter().position(|probe| *probe == id).unwrap();
+        let translations = archetype.translations(&self.data_info);
 
-            let index = archetype.translations(&self.data_info)[position];
+        bundle.sort_by(|a, b| {
+            translations[archetype.iter().position(|p| p == &a.0.id).unwrap()]
+                .cmp(&translations[archetype.iter().position(|p| p == &b.0.id).unwrap()])
+        });
 
-            data.splice(index..index, unsafe {
-                boxed_component.as_raw().iter().copied()
-            });
-
-            table.insert(position, boxed_component);
+        for ComponentPack(_, boxed_component) in bundle {
+            data.extend(unsafe { boxed_component.as_raw() });
+            table.push(boxed_component);
         }
 
         self.storage
@@ -384,13 +417,16 @@ impl Default for Registry {
     }
 }
 
-pub struct Query<'a, Q: Queryable> {
+pub struct Query<Q: Queryable>
+where
+    Self: 'static,
+{
     storage: Vec<(Archetype, Storage, Vec<usize>)>,
     tx: Sender<(Archetype, Storage)>,
-    marker: PhantomData<&'a mut Q>,
+    marker: PhantomData<Q>,
 }
 
-impl<'a, Q: Queryable> Drop for Query<'a, Q> {
+impl<Q: Queryable> Drop for Query<Q> {
     fn drop(&mut self) {
         for pair in self.storage.drain(..).map(|(x, y, _)| (x, y)) {
             self.tx.send(pair).expect("failed to return storage");
@@ -398,9 +434,9 @@ impl<'a, Q: Queryable> Drop for Query<'a, Q> {
     }
 }
 
-impl<'a, Q: Queryable> IntoIterator for Query<'a, Q> {
+impl<Q: Queryable> IntoIterator for Query<Q> {
     type Item = Q;
-    type IntoIter = QueryIter<'a, Q>;
+    type IntoIter = QueryIter<Q>;
     fn into_iter(self) -> Self::IntoIter {
         QueryIter {
             query: self,
@@ -410,8 +446,8 @@ impl<'a, Q: Queryable> IntoIterator for Query<'a, Q> {
     }
 }
 
-pub struct QueryIter<'a, Q: Queryable> {
-    query: Query<'a, Q>,
+pub struct QueryIter<Q: Queryable> {
+    query: Query<Q>,
     inner: usize,
     outer: usize,
 }
@@ -436,8 +472,8 @@ pub trait Queryable: DataExt + Send + Sync + 'static {
         Self: Sized;
 }
 
-pub trait QueryableExt<'a, 'b: 'a>: Queryable {
-    fn query(registry: &'b mut Registry) -> Query<'a, Self>
+pub trait QueryableExt: Queryable {
+    fn query(registry: &mut Registry) -> Query<Self>
     where
         Self: Sized,
     {
@@ -480,9 +516,9 @@ pub trait QueryableExt<'a, 'b: 'a>: Queryable {
     }
 }
 
-impl<'a, 'b: 'a, Q: Queryable> QueryableExt<'a, 'b> for Q {}
+impl<Q: Queryable> QueryableExt for Q {}
 
-impl<'a, Q: Queryable> Iterator for QueryIter<'a, Q> {
+impl<Q: Queryable> Iterator for QueryIter<Q> {
     type Item = Q;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -521,37 +557,20 @@ impl<'a, Q: Queryable> Iterator for QueryIter<'a, Q> {
     }
 }
 
-#[derive(Debug, PartialEq)]
-pub struct TestData1 {
-    s: u32,
+impl<T: Component> Queryable for &'static T {
+    type Target = T;
+    fn access(access: &mut Vec<Access>) {
+        access.push(Access::Ref(Self::Target::id()))
+    }
+    fn get(ptr: *mut u8, translations: &[usize], idx: &mut usize) -> Self
+    where
+        Self: Sized,
+    {
+        let component = unsafe { Self::Target::as_ref(ptr.add(translations[*idx])) };
+        *idx += 1;
+        component
+    }
 }
-impl Data for TestData1 {}
-impl Component for TestData1 {}
-#[derive(Debug, PartialEq)]
-pub struct TestData2 {
-    s: u32,
-}
-impl Data for TestData2 {}
-impl Component for TestData2 {}
-#[derive(Debug, PartialEq)]
-pub struct TestData3 {
-    s: u32,
-}
-impl Data for TestData3 {}
-impl Component for TestData3 {}
-#[derive(Debug, PartialEq)]
-pub struct TestData4 {
-    s: u32,
-}
-impl Data for TestData4 {}
-impl Component for TestData4 {}
-#[derive(Debug, PartialEq)]
-pub struct TestData5 {
-    s: u32,
-}
-impl Data for TestData5 {}
-impl Component for TestData5 {}
-
 impl<T: Component> Queryable for &'static mut T {
     type Target = T;
     fn access(access: &mut Vec<Access>) {
@@ -596,24 +615,25 @@ pub struct SystemQuery<Q: Queryable> {
     marker: PhantomData<Q>,
 }
 
-pub trait SystemIn<'a, 'b: 'a> where Self: 'b + Send {
-    fn prepare_execution(registry: &'a mut Registry) -> Self;
+pub trait SystemIn: 'static
+where
+    Self: Send,
+{
+    fn prepare_execution(registry: &mut Registry) -> Self;
     fn access(access: &mut Vec<Access>);
 }
 
-impl<'a, 'b: 'a> SystemIn<'a, 'b> for () {
-    fn prepare_execution(registry: &mut Registry) -> Self {
-        ()
-    }
+impl SystemIn for () {
+    fn prepare_execution(registry: &mut Registry) -> Self {}
     fn access(access: &mut Vec<Access>) {}
 }
 
 macro_rules! impl_system_in {
     ($($items:ident),*) => {
     #[allow(unused_parens)] // This is added because the nightly compiler complains
-        impl<'a, 'b: 'a, 'c: 'b, $($items: SystemIn<'a, 'b>),*> SystemIn<'a, 'b> for ($($items),*,)
+        impl<$($items: SystemIn),*> SystemIn for ($($items),*,)
         {
-            fn prepare_execution(registry: &'a mut Registry) -> Self {
+            fn prepare_execution(registry: &mut Registry) -> Self {
                 $(let $items = $items::prepare_execution(registry);)*
                 ($($items),*,)
             }
@@ -632,7 +652,10 @@ macro_rules! impl_system_in {
 
 impl_system_in!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
-pub trait SystemOut where Self: Send {
+pub trait SystemOut: 'static
+where
+    Self: Send,
+{
     fn handle(self, name: &str);
 }
 
@@ -640,14 +663,14 @@ impl SystemOut for () {
     fn handle(self, _: &str) {}
 }
 
-impl<E: Error + Send> SystemOut for Result<(), E> {
+impl<E: Error + Send + 'static> SystemOut for Result<(), E> {
     fn handle(self, name: &str) {
         self.expect(&format!("System `{name}` failed to execute"))
     }
-} 
+}
 
-pub trait System<'a, 'b: 'a, In: SystemIn<'a, 'b>, Out: SystemOut>: Send {
-    fn prepare_execution(&self, registry: &'a mut Registry) -> In;
+pub trait System<In: SystemIn, Out: SystemOut>: Send {
+    fn prepare_execution(&self, registry: &mut Registry) -> In;
     fn execute(&self, input: In) -> Out;
 }
 
@@ -663,16 +686,16 @@ macro_rules! impl_system {
 }
 
 macro_rules! impl_fn_system {
-    ([$($x:ident),* $(,)?]; [] reversed: [$($y:ident,)*]) => { 
+    ([$($x:ident),* $(,)?]; [] reversed: [$($y:ident,)*]) => {
         #[allow(non_snake_case)]
-        impl<'a, 'b: 'a, $($x: SystemIn<'a, 'b>,)* Return: SystemOut, Function: ::std::ops::Fn($($y,)*) -> Return + Send> System<'a, 'b, ($($x,)*), Return> for Function {
-            fn prepare_execution(&self, registry: &'a mut Registry) -> ($($x),*,) {
+        impl<$($x: SystemIn,)* Return: SystemOut, Function: ::std::ops::Fn($($y,)*) -> Return + Send> System<($($x,)*), Return> for Function {
+            fn prepare_execution(&self, registry: &mut Registry) -> ($($x),*,) {
                 <($($x),*,)>::prepare_execution(registry)
             }
             fn execute(&self, input: ($($x),*,)) -> Return {
                 let ($($x),*,) = input;
                 self.call(($($y,)*))
-            } 
+            }
         }
     };
     ([$($x:ident),* $(,)?]) => {
@@ -746,7 +769,7 @@ macro_rules! impl_system_param {
         impl<$($items: SystemParam),*> SystemParam for ($($items),*,)
         {
             type In = ($($items::In),*,);
-           
+
         }
 
         impl_system_param!(@ $($items),*);
@@ -760,10 +783,10 @@ macro_rules! impl_system_param {
 impl_system_param!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
 impl<Q: Queryable> SystemParam for SystemQuery<Q> {
-    type In = Query<'static, Q>;
+    type In = Query<Q>;
 }
-impl<'a, 'b: 'a, Q: Queryable> SystemIn<'a, 'b> for Query<'b, Q> {
-    fn prepare_execution(registry: &'a mut Registry) -> Self {
+impl<Q: Queryable> SystemIn for Query<Q> {
+    fn prepare_execution(registry: &mut Registry) -> Self {
         Q::query(registry)
     }
     fn access(access: &mut Vec<Access>) {
@@ -778,7 +801,10 @@ pub struct SystemBuilder<A: Flatten> {
 
 impl SystemBuilder<()> {
     fn new() -> SystemBuilder<()> {
-        Self { param: (), name: "unnamed".to_string() }
+        Self {
+            param: (),
+            name: "unnamed".to_string(),
+        }
     }
 }
 
@@ -801,39 +827,43 @@ impl<A: Flatten> SystemBuilder<A> {
                 },
                 self.param,
             ),
-            name: self.name
+            name: self.name,
         }
     }
 
-    fn build<'a, 'b: 'a, R: SystemOut>(
+    fn build<R: SystemOut>(
         self,
-        system: impl System<'a, 'b, <A::Output as SystemParam>::In, R> + 'static,
-    ) -> impl Schedulable<'a, 'b>
+        system: impl System<<A::Output as SystemParam>::In, R> + 'static,
+    ) -> impl Schedulable
     where
         A::Output: SystemParam,
-        <A::Output as SystemParam>::In: SystemIn<'a, 'b> + 'a,
-        R: 'a
+        <A::Output as SystemParam>::In: SystemIn,
     {
         SystemSchedulable {
             system: Box::new(system),
             input: None,
-            name: self.name
+            name: self.name,
         }
     }
 }
 
-pub struct SystemSchedulable<'a, 'b: 'a, In: SystemIn<'a, 'b> + 'a, Out: SystemOut + 'a> {
-    system: Box<dyn System<'a, 'b, In, Out>>,
+pub struct SystemSchedulable<In: SystemIn, Out: SystemOut> {
+    system: Box<dyn System<In, Out>>,
     input: Option<In>,
     name: String,
 }
 
-impl<'a, 'b: 'a, In: SystemIn<'a, 'b>, Out: SystemOut> Schedulable<'a, 'b> for SystemSchedulable<'a, 'b, In, Out> {
+impl<In: SystemIn, Out: SystemOut> Schedulable for SystemSchedulable<In, Out> {
     fn prepare_execution(&mut self, registry: &mut Registry) {
         self.input = Some(self.system.prepare_execution(registry));
     }
     fn execute(&mut self) {
-        self.system.execute(self.input.take().unwrap()).handle(&self.name);
+        self.system
+            .execute(self.input.take().unwrap())
+            .handle(&self.name);
+    }
+    fn name(&self) -> &str {
+        &self.name
     }
     fn access(&self) -> Vec<Access> {
         let mut access = vec![];
@@ -842,25 +872,64 @@ impl<'a, 'b: 'a, In: SystemIn<'a, 'b>, Out: SystemOut> Schedulable<'a, 'b> for S
     }
 }
 
-pub trait Schedulable<'a, 'b: 'a>: 'a + Send {
-    fn prepare_execution(&mut self, registry: &'b mut Registry);
+pub trait Schedulable: 'static + Send {
+    fn prepare_execution(&mut self, registry: &mut Registry);
     fn execute(&mut self);
+    fn name(&self) -> &str;
     fn access(&self) -> Vec<Access>;
 }
 
 pub type NodeId = usize;
 
 #[derive(Default)]
-pub struct Graph<'a, 'b: 'a> {
-    nodes: Vec<Box<dyn Schedulable<'a, 'b>>>,
+pub struct Graph {
+    nodes: Vec<Box<dyn Schedulable>>,
     dependencies: Vec<Vec<NodeId>>,
 }
 
-impl<'a, 'b: 'a> Graph<'a, 'b> {
-    fn add(&mut self, schedulable: impl Schedulable<'a, 'b>) {
+impl Graph {
+    fn add(&mut self, registry: &Registry, schedulable: impl Schedulable) {
         let my_id = self.nodes.len();
 
         let access = schedulable.access();
+
+        let mut overlaps = HashSet::new();
+
+        for a in &access {
+            for b in &access {
+                if a != b && a.overlaps(b) && !overlaps.contains(&(*b, *a)) {
+                    overlaps.insert((*a, *b));
+                }
+            }
+        }
+
+        if !overlaps.is_empty() {
+            let system_name = schedulable.name();
+            let mut error = String::new();
+            error.push_str(&format!(
+                "Overlapping archetypal access was detected in system `{system_name}`. \
+                The following overlaps were found:\n"
+            ));
+            for overlap in &overlaps {
+                let first_ref_type = match overlap.0 {
+                    Access::Mut(_) => "Mutable reference",
+                    Access::Ref(_) => "Reference",
+                };
+                let first_data_name = registry.data_info[match &overlap.0 {
+                    Access::Mut(id) => id,
+                    Access::Ref(id) => id,
+                }]
+                .name;
+                let second_ref_type = match overlap.1 {
+                    Access::Mut(_) => "mutable reference",
+                    Access::Ref(_) => "reference",
+                };
+                error.push_str(&format!(
+                    "\t- {first_ref_type} to `{first_data_name}` overlaps with {second_ref_type} of the same type.\n"
+                ))
+            }
+            panic!("{}", error);
+        }
 
         self.nodes.push(Box::new(schedulable));
 
@@ -883,20 +952,20 @@ impl<'a, 'b: 'a> Graph<'a, 'b> {
     }
 }
 
-pub type NodePayload<'a, 'b: 'a> = (NodeId, Box<dyn Schedulable<'a, 'b>>);
+pub type NodePayload = (NodeId, Box<dyn Schedulable>);
 
-pub struct Schedule<'a, 'b: 'a> {
-    graph: Graph<'a, 'b>,
-    work_tx: Sender<NodePayload<'a, 'b>>,
-    done_rx: Receiver<NodePayload<'a, 'b>>,
+pub struct Schedule<'a> {
+    graph: Graph,
+    work_tx: Sender<NodePayload>,
+    done_rx: Receiver<NodePayload>,
     workers: Vec<JoinHandle<()>>,
+    registry: &'a mut Registry,
 }
-impl<'a, 'b: 'a> Schedule<'a, 'b> {
-    fn new(workers: usize) {
-        let (work_tx, work_rx) = bounded::<NodePayload>(8192);
-        let (done_tx, done_rx) = bounded::<NodeId>(8192);
+impl<'a> Schedule<'a> {
+    fn new(workers: usize, registry: &'a mut Registry) -> Self {
+        let (work_tx, work_rx) = unbounded::<NodePayload>();
+        let (done_tx, done_rx) = unbounded::<NodePayload>();
         let workers = (0..workers)
-            .into_iter()
             .map(|i| {
                 let work_rx = work_rx.clone();
                 let done_tx = done_tx.clone();
@@ -905,175 +974,150 @@ impl<'a, 'b: 'a> Schedule<'a, 'b> {
                     .name(format!("Worker {i}"))
                     .spawn(move || loop {
                         let Ok((id, mut node)) = work_rx.try_recv() else {
-                        thread::sleep(Duration::from_nanos(1));
-                        continue;
-                    };
+                            thread::sleep(Duration::from_nanos(1));
+                            continue;
+                        };
 
-                       node.execute();
+                        node.execute();
 
                         done_tx
-                            .send(id)
+                            .send((id, node))
                             .expect("failed to signal work unit as done");
                     })
                     .expect("failed to start worker")
             })
             .collect::<Vec<_>>();
+        Schedule {
+            graph: Default::default(),
+            work_tx,
+            done_rx,
+            workers,
+            registry,
+        }
     }
-    fn add(&mut self, schedulable: impl Schedulable<'a, 'b>) {
-        self.graph.add(schedulable);
+    fn add(&mut self, schedulable: impl Schedulable) {
+        self.graph.add(self.registry, schedulable);
     }
     fn execute(&mut self) {
-        let mut executing = Vec::new();
+        let mut executing = HashSet::new();
 
         let not_executed = self.graph.nodes.drain(..).collect::<VecDeque<_>>();
         let mut executed = (0..not_executed.len()).map(|_| None).collect::<Vec<_>>();
-        
+
         let mut nodes_iter = not_executed.into_iter().enumerate().peekable();
 
         loop {
-            let Some((id, node)) = nodes_iter.next() else {
-                break;
-            };
-
-            loop {
-                if executing
-                            .iter()
-                            .any(|id| self.graph.dependencies[nodes_iter.peek().unwrap().0].contains(id))
-                {
-                    break;
+            #[allow(clippy::never_loop)]
+            'a: loop {
+                if let Some((next_id, _)) = nodes_iter.peek() {
+                    if executing
+                        .iter()
+                        .any(|id| self.graph.dependencies[*next_id].contains(id))
+                    {
+                        self.registry.return_storage();
+                        break;
+                    }
                 }
-                while let Ok((id, schedulable)) = self.done_rx.try_recv() {
-                    executing.remove(id);
+
+                loop {
+                    let id = self.done_rx.try_recv();
+
+                    if id.is_err() && executing.is_empty() {
+                        break 'a;
+                    }
+
+                    let Ok((id, schedulable)) = id else {
+                        continue;
+                    };
+
+                    executing.remove(&id);
                     executed[id] = Some(schedulable);
                 }
             }
 
-            executing.push(id);
+            let Some((id, mut node)) = nodes_iter.next() else {
+                break;
+            };
+
+            executing.insert(id);
+
+            node.prepare_execution(self.registry);
 
             self.work_tx
                 .try_send((id, node))
                 .expect("failed to send work unit");
         }
-
-        self.graph.nodes = executed.into_iter().filter_map(identity).collect();
+        self.graph.nodes = executed.into_iter().flatten().collect();
+        self.registry.return_storage();
     }
+}
+
+#[derive(Component, Debug, PartialEq)]
+pub struct TestData1 {
+    s: u32,
+}
+#[derive(Component, Debug, PartialEq)]
+pub struct TestData2 {
+    s: u32,
+}
+#[derive(Component, Debug, PartialEq)]
+pub struct TestData3 {
+    s: u32,
+}
+#[derive(Component, Debug, PartialEq)]
+pub struct TestData4 {
+    s: u32,
+}
+#[derive(Component, Debug, PartialEq)]
+pub struct TestData5 {
+    s: u32,
 }
 
 #[test]
 fn graph_works() {
     let mut registry = Registry::default();
-    let mut a = vec![10; 60000];
+    let mut a = vec![10; 120000];
     let i = std::time::Instant::now();
-    for i in 0..30000 {
+    for i in 0..60000 {
         let a1 = a[2 * i];
         let b1 = a[2 * i + 1];
         a[2 * i] = b1;
         a[2 * i + 1] = a1;
     }
-    println!("{:?}", std::time::Instant::now().duration_since(i) / 30000);
+    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
     for i in 0..10000usize {
         let e = registry.spawn();
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData1::info(),
-                Box::new(TestData1 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData2::info(),
-                Box::new(TestData2 { s: i as u32 }),
-            )],
-        );
+        registry
+            .commands()
+            .spawn((TestData1 { s: i as u32 }, TestData2 { s: i as u32 }));
     }
     for i in 0..10000usize {
         let e = registry.spawn();
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData1::info(),
-                Box::new(TestData1 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData2::info(),
-                Box::new(TestData2 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData3::info(),
-                Box::new(TestData3 { s: i as u32 }),
-            )],
-        );
+        registry.commands().spawn((
+            TestData1 { s: i as u32 },
+            TestData2 { s: i as u32 },
+            TestData3 { s: i as u32 },
+        ));
     }
     for i in 0..10000usize {
         let e = registry.spawn();
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData1::info(),
-                Box::new(TestData1 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData2::info(),
-                Box::new(TestData2 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData3::info(),
-                Box::new(TestData3 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData4::info(),
-                Box::new(TestData4 { s: i as u32 }),
-            )],
-        );
+        registry.commands().spawn((
+            TestData1 { s: i as u32 },
+            TestData2 { s: i as u32 },
+            TestData3 { s: i as u32 },
+            TestData4 { s: i as u32 },
+        ));
     }
     for i in 0..10000usize {
         let e = registry.spawn();
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData1::info(),
-                Box::new(TestData1 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData2::info(),
-                Box::new(TestData2 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData3::info(),
-                Box::new(TestData3 { s: i as u32 }),
-            )],
-        );
-        registry.insert(
-            e,
-            vec![ComponentPack(
-                TestData5::info(),
-                Box::new(TestData5 { s: i as u32 }),
-            )],
-        );
+        registry.commands().spawn((
+            TestData1 { s: i as u32 },
+            TestData2 { s: i as u32 },
+            TestData3 { s: i as u32 },
+            TestData5 { s: i as u32 },
+        ));
     }
+    registry.flush_commands();
     // async fn first_system(e: Entity, d: &mut TestData, t: &mut TestData2) {
     //     mem::swap(&mut d.s, &mut t.s);
     // }
@@ -1095,13 +1139,60 @@ fn graph_works() {
     }
     println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
 
-    let mut schedule = Schedule::default();
+    let mut schedule = Schedule::new(7, &mut registry);
     schedule.add(
         SystemBuilder::new()
             .with_name("test")
             .with_query::<(&mut TestData1, &mut TestData2)>()
-            .build(|query1| {
-                
+            .build(|query2: Query<(&mut TestData1, &mut TestData2)>| {
+                for (d, t) in query2 {
+                    mem::swap(&mut d.s, &mut t.s);
+                }
             }),
     );
+    schedule.add(
+        SystemBuilder::new()
+            .with_name("test")
+            .with_query::<(&mut TestData3, &mut TestData4)>()
+            .build(|query1: Query<(&mut TestData3, &mut TestData4)>| {
+                for (d, t) in query1 {
+                    mem::swap(&mut d.s, &mut t.s);
+                }
+            }),
+    );
+    schedule.add(
+        SystemBuilder::new()
+            .with_name("test")
+            .with_query::<(&mut TestData3, &mut TestData5)>()
+            .build(|query| {
+                for (d, t) in query {
+                    mem::swap(&mut d.s, &mut t.s);
+                }
+            }),
+    );
+    let i = std::time::Instant::now();
+    schedule.execute();
+    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
+}
+
+macro_rules! system {
+    ([] [query => $type:ty;] [$($call:tt)*]) => {
+        system!($($call:tt)*.with_query::<$type>() + $($($rest:tt)*);*)
+    };
+    ($name:literal $all:tt) => {
+        system!([] [$all] [SystemBuilder::new().with_name($name)])
+    };
+}
+
+#[test]
+fn graph_works2() {
+    let mut registry = Registry::default();
+    let mut schedule = Schedule::new(7, &mut registry);
+    schedule.add(system! {
+        "test"
+        query => (&mut TestData3, &mut TestData4);
+    });
+    let i = std::time::Instant::now();
+    schedule.execute();
+    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
 }
