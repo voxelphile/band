@@ -1,6 +1,6 @@
 //Hello, band!
 #![allow(dead_code)]
-#![feature(return_position_impl_trait_in_trait, fn_traits)]
+#![feature(return_position_impl_trait_in_trait, fn_traits, test)]
 
 pub use band_proc_macro::*;
 use core::slice;
@@ -16,9 +16,11 @@ use std::{
     hint::black_box,
     iter,
     marker::PhantomData,
-    mem, ptr,
+    mem,
+    process::Termination,
+    ptr,
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant}, sync::{atomic::AtomicUsize, Arc},
 };
 
 pub type Identifier = usize;
@@ -417,16 +419,90 @@ impl Default for Registry {
     }
 }
 
-pub struct Query<Q: Queryable>
+pub type Precedence = isize;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Filtered {
+    Include,
+    Exclude,
+}
+
+impl From<Filtered> for bool {
+    fn from(value: Filtered) -> Self {
+        matches!(value, Filtered::Include)
+    }
+}
+
+pub trait Filter: 'static + Send + Sized {
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered;
+}
+
+impl Filter for () {
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
+        Filtered::Include
+    }
+}
+
+pub struct Superset;
+
+impl Filter for Superset {
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
+        query_archetype.is_superset(storage_archetype).then_some(Filtered::Include).unwrap_or(Filtered::Exclude)
+    }
+}
+
+pub struct With<C: Component> {
+    marker: PhantomData<C>
+}
+
+impl<C: Component> Filter for With<C> {
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
+        let mut extra_archetype = query_archetype.clone();
+        extra_archetype.push(C::id());
+        Superset::validity(&extra_archetype, storage_archetype)
+    }
+}
+
+pub struct Without<C: Component> {
+    marker: PhantomData<C>
+}
+
+impl<C: Component> Filter for Without<C> {
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
+        storage_archetype.contains(&C::id()).then_some(Filtered::Exclude).unwrap_or(Filtered::Include)
+    }
+}
+
+
+macro_rules! impl_filter {
+    ($($items:ident),*) => {
+        #[allow(non_snake_case)]
+        impl<$($items: Filter),*> Filter for ($($items,)*) {
+            fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
+                ($(matches!($items::validity(query_archetype, storage_archetype), Filtered::Exclude)) && *).then_some(Filtered::Exclude).unwrap_or(Filtered::Include)
+            }
+        }
+
+        impl_filter!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_filter!($($tail),*);
+    };
+    (@ $head:ident) => {};
+}
+
+impl_filter!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+
+pub struct Query<Q: Queryable, F: Filter = ((), Superset)>
 where
     Self: 'static,
 {
     storage: Vec<(Archetype, Storage, Vec<usize>)>,
     tx: Sender<(Archetype, Storage)>,
-    marker: PhantomData<Q>,
+    marker: PhantomData<(Q, F)>,
 }
 
-impl<Q: Queryable> Drop for Query<Q> {
+impl<Q: Queryable, F: Filter> Drop for Query<Q, F> {
     fn drop(&mut self) {
         for pair in self.storage.drain(..).map(|(x, y, _)| (x, y)) {
             self.tx.send(pair).expect("failed to return storage");
@@ -434,9 +510,9 @@ impl<Q: Queryable> Drop for Query<Q> {
     }
 }
 
-impl<Q: Queryable> IntoIterator for Query<Q> {
+impl<Q: Queryable, F: Filter> IntoIterator for Query<Q, F> {
     type Item = Q;
-    type IntoIter = QueryIter<Q>;
+    type IntoIter = QueryIter<Q, F>;
     fn into_iter(self) -> Self::IntoIter {
         QueryIter {
             query: self,
@@ -446,13 +522,13 @@ impl<Q: Queryable> IntoIterator for Query<Q> {
     }
 }
 
-pub struct QueryIter<Q: Queryable> {
-    query: Query<Q>,
+pub struct QueryIter<Q: Queryable, F: Filter> {
+    query: Query<Q, F>,
     inner: usize,
     outer: usize,
 }
 
-pub trait Queryable: DataExt + Send + Sync + 'static {
+pub trait Queryable: DataExt + Send + Sync + 'static + Sized {
     type Target: DataExt;
     fn access(access: &mut Vec<Access>);
     fn archetype(archetype: &mut Archetype) {
@@ -460,10 +536,11 @@ pub trait Queryable: DataExt + Send + Sync + 'static {
         archetype.insert(position, Self::Target::id());
     }
     fn order(archetype: &Archetype, order: &mut Vec<usize>) {
+        dbg!("---");
         order.push(
             archetype
                 .iter()
-                .position(|probe| probe == &Self::Target::id())
+                .position(|probe| dbg!(probe) == dbg!(&Self::Target::id()))
                 .unwrap(),
         )
     }
@@ -473,7 +550,7 @@ pub trait Queryable: DataExt + Send + Sync + 'static {
 }
 
 pub trait QueryableExt: Queryable {
-    fn query(registry: &mut Registry) -> Query<Self>
+    fn query_filter<F: Filter>(registry: &mut Registry) -> Query<Self, (F, Superset)>
     where
         Self: Sized,
     {
@@ -484,7 +561,7 @@ pub trait QueryableExt: Queryable {
 
         let mut storage_archetypes = vec![];
         for storage_archetype in registry.storage.keys() {
-            if storage_archetype.is_superset(&query_archetype) {
+            if matches!(F::validity(&query_archetype, storage_archetype), Filtered::Include)  {
                 storage_archetypes.push(storage_archetype.clone());
             }
         }
@@ -514,11 +591,14 @@ pub trait QueryableExt: Queryable {
             marker: PhantomData,
         }
     }
+    fn query(registry: &mut Registry) -> Query<Self, ((), Superset)> {
+        Self::query_filter::<()>(registry)
+    }
 }
 
 impl<Q: Queryable> QueryableExt for Q {}
 
-impl<Q: Queryable> Iterator for QueryIter<Q> {
+impl<Q: Queryable, F: Filter> Iterator for QueryIter<Q, F> {
     type Item = Q;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -585,34 +665,45 @@ impl<T: Component> Queryable for &'static mut T {
         component
     }
 }
-impl<A: Data, B: Data> Data for (A, B) {}
-impl<A: Queryable, B: Queryable> Queryable for (A, B) {
-    type Target = (A, B);
-    fn access(access: &mut Vec<Access>) {
-        A::access(access);
-        B::access(access);
-    }
-    fn archetype(archetype: &mut Archetype) {
-        A::archetype(archetype);
-        B::archetype(archetype);
-    }
-    fn order(archetype: &Archetype, order: &mut Vec<usize>) {
-        A::order(archetype, order);
-        B::order(archetype, order);
-    }
-    fn get(ptr: *mut u8, translations: &[usize], idx: &mut usize) -> Self
-    where
-        Self: Sized,
-    {
-        (
-            A::get(ptr, translations, idx),
-            B::get(ptr, translations, idx),
-        )
-    }
+
+macro_rules! impl_queryable {
+    ($($items:ident),*) => {
+    #[allow(non_snake_case)]
+    impl<$($items: Data),*> Data for ($($items),*,) {}
+    impl<$($items: Queryable),*> Queryable for ($($items),*,)
+        {
+            type Target = Self;
+            fn access(access: &mut Vec<Access>) {
+                $($items::access(access);)*
+            }
+            fn archetype(archetype: &mut Archetype) {
+                $($items::archetype(archetype);)*
+            }
+            fn order(archetype: &Archetype, order: &mut Vec<usize>) {
+                $($items::order(archetype, order);)*
+            }
+            fn get(ptr: *mut u8, translations: &[usize], idx: &mut usize) -> Self
+            where
+                Self: Sized,
+            {
+                (
+                    $($items::get(ptr, translations, idx),)*
+                )
+            }
+        }
+
+        impl_queryable!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_queryable!($($tail),*);
+    };
+    (@ $head:ident) => {};
 }
 
-pub struct SystemQuery<Q: Queryable> {
-    marker: PhantomData<Q>,
+impl_queryable!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+
+pub struct SystemQuery<Q: Queryable, F: Filter> {
+    marker: PhantomData<(Q, F)>,
 }
 
 pub trait SystemIn: 'static
@@ -631,6 +722,7 @@ impl SystemIn for () {
 macro_rules! impl_system_in {
     ($($items:ident),*) => {
     #[allow(unused_parens)] // This is added because the nightly compiler complains
+    #[allow(non_snake_case)] // This is added because the nightly compiler complains
         impl<$($items: SystemIn),*> SystemIn for ($($items),*,)
         {
             fn prepare_execution(registry: &mut Registry) -> Self {
@@ -782,16 +874,26 @@ macro_rules! impl_system_param {
 
 impl_system_param!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
-impl<Q: Queryable> SystemParam for SystemQuery<Q> {
-    type In = Query<Q>;
+impl<Q: Queryable, F: Filter> SystemParam for SystemQuery<Q, F> {
+    type In = Query<Q, F>;
 }
-impl<Q: Queryable> SystemIn for Query<Q> {
+impl<Q: Queryable, F: Filter> SystemIn for Query<Q, (F, Superset)> {
     fn prepare_execution(registry: &mut Registry) -> Self {
-        Q::query(registry)
+        Q::query_filter::<F>(registry)
     }
     fn access(access: &mut Vec<Access>) {
         Q::access(access)
     }
+}
+
+impl SystemParam for Commands {
+    type In = Self;
+}
+impl SystemIn for Commands {
+    fn prepare_execution(registry: &mut Registry) -> Self {
+        registry.commands()
+    }
+    fn access(access: &mut Vec<Access>) {}
 }
 
 pub struct SystemBuilder<A: Flatten> {
@@ -799,11 +901,13 @@ pub struct SystemBuilder<A: Flatten> {
     name: String,
 }
 
+pub const UNNAMED: &str = "unnamed";
+
 impl SystemBuilder<()> {
     fn new() -> SystemBuilder<()> {
         Self {
             param: (),
-            name: "unnamed".to_string(),
+            name: UNNAMED.to_string(),
         }
     }
 }
@@ -816,11 +920,18 @@ impl<A: Flatten> SystemBuilder<A> {
         }
     }
 
-    fn with_query<Q: Queryable>(self) -> SystemBuilder<(SystemQuery<Q>, A)>
-    where
-        (SystemQuery<Q>, A): Flatten,
+    fn with_query<Q: Queryable>(self) -> SystemBuilder<(SystemQuery<Q, ((), Superset)>, A)>
+    where 
+    (SystemQuery<Q, ((), Superset)>, A): Flatten,
     {
-        SystemBuilder::<(SystemQuery<Q>, A)> {
+        Self::with_query_filter(self)
+    }
+
+    fn with_query_filter<Q: Queryable, F: Filter>(self) -> SystemBuilder<(SystemQuery<Q, F>, A)>
+    where
+        (SystemQuery<Q, F>, A): Flatten,
+    {
+        SystemBuilder::<(SystemQuery<Q, F>, A)> {
             param: (
                 SystemQuery {
                     marker: PhantomData,
@@ -834,16 +945,16 @@ impl<A: Flatten> SystemBuilder<A> {
     fn build<R: SystemOut>(
         self,
         system: impl System<<A::Output as SystemParam>::In, R> + 'static,
-    ) -> impl Schedulable
+    ) -> Box<dyn Schedulable>
     where
         A::Output: SystemParam,
         <A::Output as SystemParam>::In: SystemIn,
     {
-        SystemSchedulable {
+        Box::new(SystemSchedulable {
             system: Box::new(system),
             input: None,
             name: self.name,
-        }
+        })
     }
 }
 
@@ -888,7 +999,7 @@ pub struct Graph {
 }
 
 impl Graph {
-    fn add(&mut self, registry: &Registry, schedulable: impl Schedulable) {
+    fn add(&mut self, registry: &Registry, schedulable: Box<dyn Schedulable>) {
         let my_id = self.nodes.len();
 
         let access = schedulable.access();
@@ -931,7 +1042,7 @@ impl Graph {
             panic!("{}", error);
         }
 
-        self.nodes.push(Box::new(schedulable));
+        self.nodes.push(schedulable);
 
         let mut dependencies = Vec::new();
 
@@ -949,6 +1060,26 @@ impl Graph {
         }
 
         self.dependencies.push(dependencies);
+    }
+}
+
+pub trait IntoSchedulable<In, Out> {
+    fn into_schedulable(self) -> Box<dyn Schedulable>;
+}
+
+impl IntoSchedulable<(), ()> for Box<dyn Schedulable> {
+    fn into_schedulable(self) -> Box<dyn Schedulable> {
+        self
+    }
+}
+
+impl<In: SystemIn, Out: SystemOut, S: System<In, Out> + 'static> IntoSchedulable<In, Out> for S {
+    fn into_schedulable(self) -> Box<dyn Schedulable> {
+        Box::new(SystemSchedulable {
+            system: Box::new(self),
+            input: None,
+            name: UNNAMED.to_string(),
+        })
     }
 }
 
@@ -995,11 +1126,12 @@ impl<'a> Schedule<'a> {
             registry,
         }
     }
-    fn add(&mut self, schedulable: impl Schedulable) {
-        self.graph.add(self.registry, schedulable);
+    fn add<In, Out>(&mut self, schedulable: impl IntoSchedulable<In, Out>) {
+        self.graph
+            .add(self.registry, schedulable.into_schedulable());
     }
     fn execute(&mut self) {
-        let mut executing = HashSet::new();
+        let mut executing = Vec::new();
 
         let not_executed = self.graph.nodes.drain(..).collect::<VecDeque<_>>();
         let mut executed = (0..not_executed.len()).map(|_| None).collect::<Vec<_>>();
@@ -1014,6 +1146,7 @@ impl<'a> Schedule<'a> {
                         .iter()
                         .any(|id| self.graph.dependencies[*next_id].contains(id))
                     {
+                        self.registry.flush_commands();
                         self.registry.return_storage();
                         break;
                     }
@@ -1029,8 +1162,11 @@ impl<'a> Schedule<'a> {
                     let Ok((id, schedulable)) = id else {
                         continue;
                     };
-
-                    executing.remove(&id);
+                    let index = match executing.binary_search(&id) {
+                        Err(_) => panic!("not scheduled"),
+                        Ok(i) => i,
+                    };
+                    executing.remove(index);
                     executed[id] = Some(schedulable);
                 }
             }
@@ -1039,7 +1175,11 @@ impl<'a> Schedule<'a> {
                 break;
             };
 
-            executing.insert(id);
+            let index = match executing.binary_search(&id) {
+                Err(i) => i,
+                Ok(_) => panic!("already scheduled"),
+            };
+            executing.insert(index, id);
 
             node.prepare_execution(self.registry);
 
@@ -1048,6 +1188,7 @@ impl<'a> Schedule<'a> {
                 .expect("failed to send work unit");
         }
         self.graph.nodes = executed.into_iter().flatten().collect();
+        self.registry.flush_commands();
         self.registry.return_storage();
     }
 }
@@ -1067,32 +1208,26 @@ pub struct TestData3 {
 #[derive(Component, Debug, PartialEq)]
 pub struct TestData4 {
     s: u32,
-}
+}   
 #[derive(Component, Debug, PartialEq)]
 pub struct TestData5 {
     s: u32,
 }
+#[derive(Component, Debug, PartialEq)]
+pub struct DidItSpawn(usize);
 
-#[test]
-fn graph_works() {
+extern crate test;
+use test::Bencher;
+#[bench]
+fn benchmark(bencher: &mut Bencher) -> impl Termination {
     let mut registry = Registry::default();
-    let mut a = vec![10; 120000];
-    let i = std::time::Instant::now();
-    for i in 0..60000 {
-        let a1 = a[2 * i];
-        let b1 = a[2 * i + 1];
-        a[2 * i] = b1;
-        a[2 * i + 1] = a1;
-    }
-    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
+
     for i in 0..10000usize {
-        let e = registry.spawn();
         registry
             .commands()
             .spawn((TestData1 { s: i as u32 }, TestData2 { s: i as u32 }));
     }
     for i in 0..10000usize {
-        let e = registry.spawn();
         registry.commands().spawn((
             TestData1 { s: i as u32 },
             TestData2 { s: i as u32 },
@@ -1100,7 +1235,13 @@ fn graph_works() {
         ));
     }
     for i in 0..10000usize {
-        let e = registry.spawn();
+        registry.commands().spawn((
+            TestData1 { s: i as u32 },
+            TestData3 { s: i as u32 },
+            TestData4 { s: i as u32 },
+        ));
+    }
+    for i in 0..10000usize {
         registry.commands().spawn((
             TestData1 { s: i as u32 },
             TestData2 { s: i as u32 },
@@ -1108,91 +1249,27 @@ fn graph_works() {
             TestData4 { s: i as u32 },
         ));
     }
-    for i in 0..10000usize {
-        let e = registry.spawn();
-        registry.commands().spawn((
-            TestData1 { s: i as u32 },
-            TestData2 { s: i as u32 },
-            TestData3 { s: i as u32 },
-            TestData5 { s: i as u32 },
-        ));
-    }
+
     registry.flush_commands();
-    // async fn first_system(e: Entity, d: &mut TestData, t: &mut TestData2) {
-    //     mem::swap(&mut d.s, &mut t.s);
-    // }
-    // async fn second_system(e: Entity, d: &mut TestData3, t: &mut TestData4) {
-    //     mem::swap(&mut d.s, &mut t.s);
-    // }
-    // async fn third_system(e: Entity, d: &mut TestData3, t: &mut TestData5) {
-    //     mem::swap(&mut d.s, &mut t.s);
-    // }
-    let i = std::time::Instant::now();
-    for (d, t) in <(&mut TestData1, &mut TestData2)>::query(&mut registry) {
-        mem::swap(&mut d.s, &mut t.s);
-    }
-    for (d, t) in <(&mut TestData3, &mut TestData4)>::query(&mut registry) {
-        mem::swap(&mut d.s, &mut t.s);
-    }
-    for (d, t) in <(&mut TestData3, &mut TestData5)>::query(&mut registry) {
-        mem::swap(&mut d.s, &mut t.s);
-    }
-    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
-
+    dbg!(TestData2::id(), TestData3::id(), TestData4::id());
     let mut schedule = Schedule::new(7, &mut registry);
-    schedule.add(
-        SystemBuilder::new()
-            .with_name("test")
-            .with_query::<(&mut TestData1, &mut TestData2)>()
-            .build(|query2: Query<(&mut TestData1, &mut TestData2)>| {
-                for (d, t) in query2 {
-                    mem::swap(&mut d.s, &mut t.s);
-                }
-            }),
-    );
-    schedule.add(
-        SystemBuilder::new()
-            .with_name("test")
-            .with_query::<(&mut TestData3, &mut TestData4)>()
-            .build(|query1: Query<(&mut TestData3, &mut TestData4)>| {
-                for (d, t) in query1 {
-                    mem::swap(&mut d.s, &mut t.s);
-                }
-            }),
-    );
-    schedule.add(
-        SystemBuilder::new()
-            .with_name("test")
-            .with_query::<(&mut TestData3, &mut TestData5)>()
-            .build(|query| {
-                for (d, t) in query {
-                    mem::swap(&mut d.s, &mut t.s);
-                }
-            }),
-    );
-    let i = std::time::Instant::now();
-    schedule.execute();
-    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
-}
-
-macro_rules! system {
-    ([] [query => $type:ty;] [$($call:tt)*]) => {
-        system!($($call:tt)*.with_query::<$type>() + $($($rest:tt)*);*)
-    };
-    ($name:literal $all:tt) => {
-        system!([] [$all] [SystemBuilder::new().with_name($name)])
-    };
-}
-
-#[test]
-fn graph_works2() {
-    let mut registry = Registry::default();
-    let mut schedule = Schedule::new(7, &mut registry);
-    schedule.add(system! {
-        "test"
-        query => (&mut TestData3, &mut TestData4);
+    schedule.add(move |query1: Query<(&mut TestData3, &mut TestData4)>| {
+        for (a, b) in query1 {
+            a.s += 1;
+            dbg!(a);
+        }
     });
-    let i = std::time::Instant::now();
-    schedule.execute();
-    println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
+    schedule.add(move |query1: Query<(&mut TestData3, &mut TestData4), (Without<TestData2>, Superset)>| {
+        for (a, b) in query1 {
+            a.s += 1;
+            dbg!(a);
+        }
+
+    });
+
+    bencher.iter(|| {
+        schedule.execute();
+    });
+    drop(schedule);
+
 }
