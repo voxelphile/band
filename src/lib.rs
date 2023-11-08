@@ -1,17 +1,18 @@
 //Hello, band!
 #![allow(dead_code)]
+#![feature(return_position_impl_trait_in_trait, fn_traits)]
 
 use core::slice;
+use crossbeam::channel::*;
 use derive_more::*;
 use std::{
     any::{type_name, TypeId},
     arch,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     iter,
     marker::PhantomData,
     mem, ptr,
-    sync::mpsc::{self, Receiver, Sender},
-    time::Instant,
+    time::{Instant, Duration}, hint::black_box, error::Error, thread::{JoinHandle, self}, convert::identity,
 };
 
 pub type Identifier = usize;
@@ -132,6 +133,23 @@ pub struct DataInfo {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deref, DerefMut, Default)]
 pub struct Archetype(Vec<DataId>);
+
+pub enum Access {
+    Ref(DataId),
+    Mut(DataId),
+}
+
+impl Access {
+    fn overlaps(&self, other: &Self) -> bool {
+        use Access::*;
+        match (self, other) {
+            (Ref(_), Ref(_)) => false,
+            (Ref(x), Mut(y)) |
+            (Mut(x), Ref(y)) |
+            (Mut(x), Mut(y)) => x == y,
+        }
+    }
+}
 
 impl Archetype {
     fn size(&self, data_info: &HashMap<DataId, DataInfo>) -> usize {
@@ -360,8 +378,8 @@ impl Default for Registry {
             data_info: Default::default(),
             storage: Default::default(),
             mapping: Default::default(),
-            return_storage: mpsc::channel(),
-            cmds: mpsc::channel(),
+            return_storage: unbounded(),
+            cmds: unbounded(),
         }
     }
 }
@@ -400,6 +418,7 @@ pub struct QueryIter<'a, Q: Queryable> {
 
 pub trait Queryable: DataExt + Send + Sync + 'static {
     type Target: DataExt;
+    fn access(access: &mut Vec<Access>);
     fn archetype(archetype: &mut Archetype) {
         let position = archetype.ordered_position(&Self::Target::id());
         archetype.insert(position, Self::Target::id());
@@ -417,8 +436,8 @@ pub trait Queryable: DataExt + Send + Sync + 'static {
         Self: Sized;
 }
 
-pub trait QueryExt<'a>: Queryable {
-    fn query(registry: &'a mut Registry) -> Query<'a, Self>
+pub trait QueryableExt<'a, 'b: 'a>: Queryable {
+    fn query(registry: &'b mut Registry) -> Query<'a, Self>
     where
         Self: Sized,
     {
@@ -461,7 +480,7 @@ pub trait QueryExt<'a>: Queryable {
     }
 }
 
-impl<Q: Queryable> QueryExt<'_> for Q {}
+impl<'a, 'b: 'a, Q: Queryable> QueryableExt<'a, 'b> for Q {}
 
 impl<'a, Q: Queryable> Iterator for QueryIter<'a, Q> {
     type Item = Q;
@@ -535,6 +554,9 @@ impl Component for TestData5 {}
 
 impl<T: Component> Queryable for &'static mut T {
     type Target = T;
+    fn access(access: &mut Vec<Access>) {
+        access.push(Access::Mut(Self::Target::id()))
+    }
     fn get(ptr: *mut u8, translations: &[usize], idx: &mut usize) -> Self
     where
         Self: Sized,
@@ -547,6 +569,10 @@ impl<T: Component> Queryable for &'static mut T {
 impl<A: Data, B: Data> Data for (A, B) {}
 impl<A: Queryable, B: Queryable> Queryable for (A, B) {
     type Target = (A, B);
+    fn access(access: &mut Vec<Access>) {
+        A::access(access);
+        B::access(access);
+    }
     fn archetype(archetype: &mut Archetype) {
         A::archetype(archetype);
         B::archetype(archetype);
@@ -566,11 +592,372 @@ impl<A: Queryable, B: Queryable> Queryable for (A, B) {
     }
 }
 
-pub trait System {}
+pub struct SystemQuery<Q: Queryable> {
+    marker: PhantomData<Q>,
+}
 
-pub struct Graph {}
+pub trait SystemIn<'a, 'b: 'a> where Self: 'b + Send {
+    fn prepare_execution(registry: &'a mut Registry) -> Self;
+    fn access(access: &mut Vec<Access>);
+}
 
-pub struct Schedule {}
+impl<'a, 'b: 'a> SystemIn<'a, 'b> for () {
+    fn prepare_execution(registry: &mut Registry) -> Self {
+        ()
+    }
+    fn access(access: &mut Vec<Access>) {}
+}
+
+macro_rules! impl_system_in {
+    ($($items:ident),*) => {
+    #[allow(unused_parens)] // This is added because the nightly compiler complains
+        impl<'a, 'b: 'a, 'c: 'b, $($items: SystemIn<'a, 'b>),*> SystemIn<'a, 'b> for ($($items),*,)
+        {
+            fn prepare_execution(registry: &'a mut Registry) -> Self {
+                $(let $items = $items::prepare_execution(registry);)*
+                ($($items),*,)
+            }
+            fn access(access: &mut Vec<Access>) {
+                $($items::access(access);)*
+            }
+        }
+
+        impl_system_in!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_system_in!($($tail),*);
+    };
+    (@ $head:ident) => {};
+}
+
+impl_system_in!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+
+pub trait SystemOut where Self: Send {
+    fn handle(self, name: &str);
+}
+
+impl SystemOut for () {
+    fn handle(self, _: &str) {}
+}
+
+impl<E: Error + Send> SystemOut for Result<(), E> {
+    fn handle(self, name: &str) {
+        self.expect(&format!("System `{name}` failed to execute"))
+    }
+} 
+
+pub trait System<'a, 'b: 'a, In: SystemIn<'a, 'b>, Out: SystemOut>: Send {
+    fn prepare_execution(&self, registry: &'a mut Registry) -> In;
+    fn execute(&self, input: In) -> Out;
+}
+
+macro_rules! impl_system {
+    ($($items:ident),*) => {
+        impl_fn_system!([$($items),*]);
+        impl_system!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_system!($($tail),*);
+    };
+    (@ $head:ident) => {};
+}
+
+macro_rules! impl_fn_system {
+    ([$($x:ident),* $(,)?]; [] reversed: [$($y:ident,)*]) => { 
+        #[allow(non_snake_case)]
+        impl<'a, 'b: 'a, $($x: SystemIn<'a, 'b>,)* Return: SystemOut, Function: ::std::ops::Fn($($y,)*) -> Return + Send> System<'a, 'b, ($($x,)*), Return> for Function {
+            fn prepare_execution(&self, registry: &'a mut Registry) -> ($($x),*,) {
+                <($($x),*,)>::prepare_execution(registry)
+            }
+            fn execute(&self, input: ($($x),*,)) -> Return {
+                let ($($x),*,) = input;
+                self.call(($($y,)*))
+            } 
+        }
+    };
+    ([$($x:ident),* $(,)?]) => {
+        impl_fn_system!([$($x),*]; [$($x),*] reversed: []);
+    };
+    ([$($x:ident),* $(,)?]; [$head:ident $(, $tail:ident)*] reversed: [$($reversed:ident,)*]) => {
+        impl_fn_system!([$($x),*]; [$($tail),*] reversed: [$head, $($reversed,)*]);
+    };
+}
+
+impl_system!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+
+pub trait Flatten {
+    type Output;
+    fn flatten(self) -> Self::Output;
+}
+
+impl Flatten for () {
+    type Output = ();
+    fn flatten(self) -> Self::Output {
+        self
+    }
+}
+
+macro_rules! cons {
+    () => (
+        ()
+    );
+    ($head:tt) => (
+        ($head, ())
+    );
+    ($head:tt, $($tail:tt,)*) => (
+        ($head, cons!($($tail,)*))
+    );
+}
+
+macro_rules! impl_flatten {
+    ($($items:ident),*) => {
+    #[allow(unused_parens)] // This is added because the nightly compiler complains
+        impl<$($items),*> Flatten for cons!($($items,)*)
+        {
+            type Output = ($($items,)*);
+            fn flatten(self) -> Self::Output {
+                #[allow(non_snake_case)]
+                let cons!($($items,)*) = self;
+                ($($items,)*)
+            }
+        }
+
+        impl_flatten!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_flatten!($($tail),*);
+    };
+    (@ $head:ident) => {};
+}
+
+impl_flatten!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+
+pub trait SystemParam {
+    type In;
+}
+
+impl SystemParam for () {
+    type In = ();
+}
+
+macro_rules! impl_system_param {
+    ($($items:ident),*) => {
+        #[allow(non_snake_case)]
+        impl<$($items: SystemParam),*> SystemParam for ($($items),*,)
+        {
+            type In = ($($items::In),*,);
+           
+        }
+
+        impl_system_param!(@ $($items),*);
+    };
+    (@ $head:ident, $($tail:ident),*) => {
+        impl_system_param!($($tail),*);
+    };
+    (@ $head:ident) => {};
+}
+
+impl_system_param!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
+
+impl<Q: Queryable> SystemParam for SystemQuery<Q> {
+    type In = Query<'static, Q>;
+}
+impl<'a, 'b: 'a, Q: Queryable> SystemIn<'a, 'b> for Query<'b, Q> {
+    fn prepare_execution(registry: &'a mut Registry) -> Self {
+        Q::query(registry)
+    }
+    fn access(access: &mut Vec<Access>) {
+        Q::access(access)
+    }
+}
+
+pub struct SystemBuilder<A: Flatten> {
+    param: A,
+    name: String,
+}
+
+impl SystemBuilder<()> {
+    fn new() -> SystemBuilder<()> {
+        Self { param: (), name: "unnamed".to_string() }
+    }
+}
+
+impl<A: Flatten> SystemBuilder<A> {
+    fn with_name(self, name: impl ToString) -> Self {
+        Self {
+            name: name.to_string(),
+            ..self
+        }
+    }
+
+    fn with_query<Q: Queryable>(self) -> SystemBuilder<(SystemQuery<Q>, A)>
+    where
+        (SystemQuery<Q>, A): Flatten,
+    {
+        SystemBuilder::<(SystemQuery<Q>, A)> {
+            param: (
+                SystemQuery {
+                    marker: PhantomData,
+                },
+                self.param,
+            ),
+            name: self.name
+        }
+    }
+
+    fn build<'a, 'b: 'a, R: SystemOut>(
+        self,
+        system: impl System<'a, 'b, <A::Output as SystemParam>::In, R> + 'static,
+    ) -> impl Schedulable<'a, 'b>
+    where
+        A::Output: SystemParam,
+        <A::Output as SystemParam>::In: SystemIn<'a, 'b> + 'a,
+        R: 'a
+    {
+        SystemSchedulable {
+            system: Box::new(system),
+            input: None,
+            name: self.name
+        }
+    }
+}
+
+pub struct SystemSchedulable<'a, 'b: 'a, In: SystemIn<'a, 'b> + 'a, Out: SystemOut + 'a> {
+    system: Box<dyn System<'a, 'b, In, Out>>,
+    input: Option<In>,
+    name: String,
+}
+
+impl<'a, 'b: 'a, In: SystemIn<'a, 'b>, Out: SystemOut> Schedulable<'a, 'b> for SystemSchedulable<'a, 'b, In, Out> {
+    fn prepare_execution(&mut self, registry: &mut Registry) {
+        self.input = Some(self.system.prepare_execution(registry));
+    }
+    fn execute(&mut self) {
+        self.system.execute(self.input.take().unwrap()).handle(&self.name);
+    }
+    fn access(&self) -> Vec<Access> {
+        let mut access = vec![];
+        In::access(&mut access);
+        access
+    }
+}
+
+pub trait Schedulable<'a, 'b: 'a>: 'a + Send {
+    fn prepare_execution(&mut self, registry: &'b mut Registry);
+    fn execute(&mut self);
+    fn access(&self) -> Vec<Access>;
+}
+
+pub type NodeId = usize;
+
+#[derive(Default)]
+pub struct Graph<'a, 'b: 'a> {
+    nodes: Vec<Box<dyn Schedulable<'a, 'b>>>,
+    dependencies: Vec<Vec<NodeId>>,
+}
+
+impl<'a, 'b: 'a> Graph<'a, 'b> {
+    fn add(&mut self, schedulable: impl Schedulable<'a, 'b>) {
+        let my_id = self.nodes.len();
+
+        let access = schedulable.access();
+
+        self.nodes.push(Box::new(schedulable));
+
+        let mut dependencies = Vec::new();
+
+        'a: for (their_id, them) in self.nodes[..my_id].iter().enumerate().rev() {
+            let their_access = them.access();
+
+            for my_access in &access {
+                for their_access in &their_access {
+                    if my_access.overlaps(their_access) {
+                        dependencies.push(their_id);
+                        continue 'a;
+                    }
+                }
+            }
+        }
+
+        self.dependencies.push(dependencies);
+    }
+}
+
+pub type NodePayload<'a, 'b: 'a> = (NodeId, Box<dyn Schedulable<'a, 'b>>);
+
+pub struct Schedule<'a, 'b: 'a> {
+    graph: Graph<'a, 'b>,
+    work_tx: Sender<NodePayload<'a, 'b>>,
+    done_rx: Receiver<NodePayload<'a, 'b>>,
+    workers: Vec<JoinHandle<()>>,
+}
+impl<'a, 'b: 'a> Schedule<'a, 'b> {
+    fn new(workers: usize) {
+        let (work_tx, work_rx) = bounded::<NodePayload>(8192);
+        let (done_tx, done_rx) = bounded::<NodeId>(8192);
+        let workers = (0..workers)
+            .into_iter()
+            .map(|i| {
+                let work_rx = work_rx.clone();
+                let done_tx = done_tx.clone();
+
+                thread::Builder::new()
+                    .name(format!("Worker {i}"))
+                    .spawn(move || loop {
+                        let Ok((id, mut node)) = work_rx.try_recv() else {
+                        thread::sleep(Duration::from_nanos(1));
+                        continue;
+                    };
+
+                       node.execute();
+
+                        done_tx
+                            .send(id)
+                            .expect("failed to signal work unit as done");
+                    })
+                    .expect("failed to start worker")
+            })
+            .collect::<Vec<_>>();
+    }
+    fn add(&mut self, schedulable: impl Schedulable<'a, 'b>) {
+        self.graph.add(schedulable);
+    }
+    fn execute(&mut self) {
+        let mut executing = Vec::new();
+
+        let not_executed = self.graph.nodes.drain(..).collect::<VecDeque<_>>();
+        let mut executed = (0..not_executed.len()).map(|_| None).collect::<Vec<_>>();
+        
+        let mut nodes_iter = not_executed.into_iter().enumerate().peekable();
+
+        loop {
+            let Some((id, node)) = nodes_iter.next() else {
+                break;
+            };
+
+            loop {
+                if executing
+                            .iter()
+                            .any(|id| self.graph.dependencies[nodes_iter.peek().unwrap().0].contains(id))
+                {
+                    break;
+                }
+                while let Ok((id, schedulable)) = self.done_rx.try_recv() {
+                    executing.remove(id);
+                    executed[id] = Some(schedulable);
+                }
+            }
+
+            executing.push(id);
+
+            self.work_tx
+                .try_send((id, node))
+                .expect("failed to send work unit");
+        }
+
+        self.graph.nodes = executed.into_iter().filter_map(identity).collect();
+    }
+}
 
 #[test]
 fn graph_works() {
@@ -707,4 +1094,14 @@ fn graph_works() {
         mem::swap(&mut d.s, &mut t.s);
     }
     println!("{:?}", std::time::Instant::now().duration_since(i) / 60000);
+
+    let mut schedule = Schedule::default();
+    schedule.add(
+        SystemBuilder::new()
+            .with_name("test")
+            .with_query::<(&mut TestData1, &mut TestData2)>()
+            .build(|query1| {
+                
+            }),
+    );
 }
