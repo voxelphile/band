@@ -19,8 +19,9 @@ use std::{
     mem,
     process::Termination,
     ptr,
+    sync::{atomic::AtomicUsize, Arc},
     thread::{self, JoinHandle},
-    time::{Duration, Instant}, sync::{atomic::AtomicUsize, Arc},
+    time::{Duration, Instant},
 };
 
 pub type Identifier = usize;
@@ -168,13 +169,13 @@ impl Archetype {
             .collect()
     }
     fn ordered_position(&self, id: &DataId) -> usize {
-        match self.binary_search_by(|probe| probe.cmp(&id)) {
+        match self.binary_search_by(|probe| probe.cmp(id)) {
             Ok(i) => i,
             Err(i) => i,
         }
     }
     fn is_superset(&self, other: &Archetype) -> bool {
-        other.iter().all(|probe| self.contains(&probe))
+        other.iter().all(|probe| self.contains(probe))
     }
 }
 
@@ -421,65 +422,130 @@ impl Default for Registry {
 
 pub type Precedence = isize;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Filtered {
-    Include,
-    Exclude,
+#[derive(Debug)]
+pub enum FilterOp {
+    And,
+    Or,
 }
 
-impl From<Filtered> for bool {
-    fn from(value: Filtered) -> Self {
-        matches!(value, Filtered::Include)
+#[derive(Debug)]
+pub struct Filter {
+    precedence: isize,
+    op: FilterOp,
+    validity: bool,
+}
+
+pub trait Filterable: 'static + Send {
+    fn precedence() -> Precedence {
+        unreachable!()
+    }
+    fn op() -> FilterOp {
+        unreachable!()
+    }
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool {
+        unreachable!()
+    }
+    fn push(filters: &mut Vec<Filter>, query_archetype: &Archetype, storage_archetype: &Archetype)
+    where
+        Self: Sized,
+    {
+        filters.push(Filter {
+            precedence: Self::precedence(),
+            op: Self::op(),
+            validity: Self::validity(query_archetype, storage_archetype),
+        });
     }
 }
 
-pub trait Filter: 'static + Send + Sized {
-    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered;
-}
-
-impl Filter for () {
-    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
-        Filtered::Include
+impl Filterable for () {
+    fn precedence() -> Precedence {
+        -100
+    }
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool {
+        false
+    }
+    fn op() -> FilterOp {
+        FilterOp::Or
     }
 }
 
-pub struct Superset;
+pub struct Subset;
 
-impl Filter for Superset {
-    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
-        query_archetype.is_superset(storage_archetype).then_some(Filtered::Include).unwrap_or(Filtered::Exclude)
+impl Filterable for Subset {
+    fn precedence() -> Precedence {
+        100
+    }
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool {
+        storage_archetype.is_superset(query_archetype)
+    }
+    fn op() -> FilterOp {
+        FilterOp::Or
     }
 }
 
 pub struct With<C: Component> {
-    marker: PhantomData<C>
+    marker: PhantomData<C>,
 }
 
-impl<C: Component> Filter for With<C> {
-    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
+impl<C: Component> Filterable for With<C> {
+    fn precedence() -> Precedence {
+        10
+    }
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool {
         let mut extra_archetype = query_archetype.clone();
         extra_archetype.push(C::id());
-        Superset::validity(&extra_archetype, storage_archetype)
+        Subset::validity(&extra_archetype, storage_archetype)
+    }
+    fn op() -> FilterOp {
+        FilterOp::And
     }
 }
 
 pub struct Without<C: Component> {
-    marker: PhantomData<C>
+    marker: PhantomData<C>,
 }
 
-impl<C: Component> Filter for Without<C> {
-    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
-        storage_archetype.contains(&C::id()).then_some(Filtered::Exclude).unwrap_or(Filtered::Include)
+impl<C: Component> Filterable for Without<C> {
+    fn precedence() -> Precedence {
+        -10
+    }
+    fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool {
+        storage_archetype.contains(&C::id())
+    }
+    fn op() -> FilterOp {
+        FilterOp::And
     }
 }
 
+pub trait FoldFilter {
+    fn fold_validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool;
+}
 
 macro_rules! impl_filter {
     ($($items:ident),*) => {
         #[allow(non_snake_case)]
-        impl<$($items: Filter),*> Filter for ($($items,)*) {
-            fn validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> Filtered {
-                ($(matches!($items::validity(query_archetype, storage_archetype), Filtered::Exclude)) && *).then_some(Filtered::Exclude).unwrap_or(Filtered::Include)
+        impl<$($items: Filterable),*> Filterable for ($($items,)*) {
+            fn push(filters: &mut Vec<Filter>, query_archetype: &Archetype, storage_archetype: &Archetype)
+            where
+                Self: Sized,
+            {
+                $($items::push(filters, query_archetype, storage_archetype);)*
+            }
+        }
+        #[allow(non_snake_case)]
+        impl<$($items: Filterable),*> FoldFilter for ($($items,)*) {
+            fn fold_validity(query_archetype: &Archetype, storage_archetype: &Archetype) -> bool {
+                let mut filters = vec![];
+                Subset::push(&mut filters, query_archetype, storage_archetype);
+                $($items::push(&mut filters, query_archetype, storage_archetype);)*
+                filters.sort_by(|a, b| b.precedence.cmp(&a.precedence));
+                filters.into_iter()
+                    .fold(false, |accum, filter| {
+                        match filter.op {
+                            FilterOp::And => accum && filter.validity,
+                            FilterOp::Or => accum || filter.validity,
+                        }
+                    })
             }
         }
 
@@ -493,7 +559,7 @@ macro_rules! impl_filter {
 
 impl_filter!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
-pub struct Query<Q: Queryable, F: Filter = ((), Superset)>
+pub struct Query<Q: Queryable, F: Filterable = ((),)>
 where
     Self: 'static,
 {
@@ -502,7 +568,7 @@ where
     marker: PhantomData<(Q, F)>,
 }
 
-impl<Q: Queryable, F: Filter> Drop for Query<Q, F> {
+impl<Q: Queryable, F: Filterable> Drop for Query<Q, F> {
     fn drop(&mut self) {
         for pair in self.storage.drain(..).map(|(x, y, _)| (x, y)) {
             self.tx.send(pair).expect("failed to return storage");
@@ -510,7 +576,7 @@ impl<Q: Queryable, F: Filter> Drop for Query<Q, F> {
     }
 }
 
-impl<Q: Queryable, F: Filter> IntoIterator for Query<Q, F> {
+impl<Q: Queryable, F: Filterable> IntoIterator for Query<Q, F> {
     type Item = Q;
     type IntoIter = QueryIter<Q, F>;
     fn into_iter(self) -> Self::IntoIter {
@@ -522,7 +588,7 @@ impl<Q: Queryable, F: Filter> IntoIterator for Query<Q, F> {
     }
 }
 
-pub struct QueryIter<Q: Queryable, F: Filter> {
+pub struct QueryIter<Q: Queryable, F: Filterable> {
     query: Query<Q, F>,
     inner: usize,
     outer: usize,
@@ -536,11 +602,10 @@ pub trait Queryable: DataExt + Send + Sync + 'static + Sized {
         archetype.insert(position, Self::Target::id());
     }
     fn order(archetype: &Archetype, order: &mut Vec<usize>) {
-        dbg!("---");
         order.push(
             archetype
                 .iter()
-                .position(|probe| dbg!(probe) == dbg!(&Self::Target::id()))
+                .position(|probe| probe == &Self::Target::id())
                 .unwrap(),
         )
     }
@@ -550,7 +615,7 @@ pub trait Queryable: DataExt + Send + Sync + 'static + Sized {
 }
 
 pub trait QueryableExt: Queryable {
-    fn query_filter<F: Filter>(registry: &mut Registry) -> Query<Self, (F, Superset)>
+    fn query_filter<F: Filterable + FoldFilter>(registry: &mut Registry) -> Query<Self, F>
     where
         Self: Sized,
     {
@@ -561,7 +626,7 @@ pub trait QueryableExt: Queryable {
 
         let mut storage_archetypes = vec![];
         for storage_archetype in registry.storage.keys() {
-            if matches!(F::validity(&query_archetype, storage_archetype), Filtered::Include)  {
+            if F::fold_validity(&query_archetype, storage_archetype) {
                 storage_archetypes.push(storage_archetype.clone());
             }
         }
@@ -591,14 +656,14 @@ pub trait QueryableExt: Queryable {
             marker: PhantomData,
         }
     }
-    fn query(registry: &mut Registry) -> Query<Self, ((), Superset)> {
-        Self::query_filter::<()>(registry)
+    fn query(registry: &mut Registry) -> Query<Self, ((),)> {
+        Self::query_filter::<((),)>(registry)
     }
 }
 
 impl<Q: Queryable> QueryableExt for Q {}
 
-impl<Q: Queryable, F: Filter> Iterator for QueryIter<Q, F> {
+impl<Q: Queryable, F: Filterable> Iterator for QueryIter<Q, F> {
     type Item = Q;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -702,7 +767,7 @@ macro_rules! impl_queryable {
 
 impl_queryable!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
-pub struct SystemQuery<Q: Queryable, F: Filter> {
+pub struct SystemQuery<Q: Queryable, F: Filterable> {
     marker: PhantomData<(Q, F)>,
 }
 
@@ -874,10 +939,10 @@ macro_rules! impl_system_param {
 
 impl_system_param!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z);
 
-impl<Q: Queryable, F: Filter> SystemParam for SystemQuery<Q, F> {
+impl<Q: Queryable, F: Filterable + FoldFilter> SystemParam for SystemQuery<Q, F> {
     type In = Query<Q, F>;
 }
-impl<Q: Queryable, F: Filter> SystemIn for Query<Q, (F, Superset)> {
+impl<Q: Queryable, F: Filterable + FoldFilter> SystemIn for Query<Q, F> {
     fn prepare_execution(registry: &mut Registry) -> Self {
         Q::query_filter::<F>(registry)
     }
@@ -920,14 +985,14 @@ impl<A: Flatten> SystemBuilder<A> {
         }
     }
 
-    fn with_query<Q: Queryable>(self) -> SystemBuilder<(SystemQuery<Q, ((), Superset)>, A)>
-    where 
-    (SystemQuery<Q, ((), Superset)>, A): Flatten,
+    fn with_query<Q: Queryable>(self) -> SystemBuilder<(SystemQuery<Q, ()>, A)>
+    where
+        (SystemQuery<Q, ()>, A): Flatten,
     {
         Self::with_query_filter(self)
     }
 
-    fn with_query_filter<Q: Queryable, F: Filter>(self) -> SystemBuilder<(SystemQuery<Q, F>, A)>
+    fn with_query_filter<Q: Queryable, F: Filterable>(self) -> SystemBuilder<(SystemQuery<Q, F>, A)>
     where
         (SystemQuery<Q, F>, A): Flatten,
     {
@@ -1142,12 +1207,10 @@ impl<'a> Schedule<'a> {
             #[allow(clippy::never_loop)]
             'a: loop {
                 if let Some((next_id, _)) = nodes_iter.peek() {
-                    if executing
+                    if !executing
                         .iter()
                         .any(|id| self.graph.dependencies[*next_id].contains(id))
                     {
-                        self.registry.flush_commands();
-                        self.registry.return_storage();
                         break;
                     }
                 }
@@ -1181,6 +1244,9 @@ impl<'a> Schedule<'a> {
             };
             executing.insert(index, id);
 
+            self.registry.return_storage();
+            self.registry.flush_commands();
+
             node.prepare_execution(self.registry);
 
             self.work_tx
@@ -1188,8 +1254,8 @@ impl<'a> Schedule<'a> {
                 .expect("failed to send work unit");
         }
         self.graph.nodes = executed.into_iter().flatten().collect();
-        self.registry.flush_commands();
         self.registry.return_storage();
+        self.registry.flush_commands();
     }
 }
 
@@ -1208,7 +1274,7 @@ pub struct TestData3 {
 #[derive(Component, Debug, PartialEq)]
 pub struct TestData4 {
     s: u32,
-}   
+}
 #[derive(Component, Debug, PartialEq)]
 pub struct TestData5 {
     s: u32,
@@ -1222,54 +1288,76 @@ use test::Bencher;
 fn benchmark(bencher: &mut Bencher) -> impl Termination {
     let mut registry = Registry::default();
 
-    for i in 0..10000usize {
+    for i in 0..10usize {
         registry
             .commands()
-            .spawn((TestData1 { s: i as u32 }, TestData2 { s: i as u32 }));
+            .spawn((TestData1 { s: 0 as u32 }, TestData2 { s: 0 as u32 }));
     }
-    for i in 0..10000usize {
+    for i in 0..10usize {
         registry.commands().spawn((
-            TestData1 { s: i as u32 },
-            TestData2 { s: i as u32 },
-            TestData3 { s: i as u32 },
+            TestData1 { s: 0 as u32 },
+            TestData2 { s: 0 as u32 },
+            TestData3 { s: 0 as u32 },
         ));
     }
-    for i in 0..10000usize {
+    for i in 0..10usize {
         registry.commands().spawn((
-            TestData1 { s: i as u32 },
-            TestData3 { s: i as u32 },
-            TestData4 { s: i as u32 },
+            TestData1 { s: 0 as u32 },
+            TestData3 { s: 0 as u32 },
+            TestData4 { s: 0 as u32 },
         ));
     }
-    for i in 0..10000usize {
-        registry.commands().spawn((
-            TestData1 { s: i as u32 },
-            TestData2 { s: i as u32 },
-            TestData3 { s: i as u32 },
-            TestData4 { s: i as u32 },
-        ));
+    for i in 0..10usize {
+        if i % 2 == 0 {
+            registry.commands().spawn((
+                TestData1 { s: 0 as u32 },
+                TestData2 { s: 0 as u32 },
+                TestData3 { s: 0 as u32 },
+                TestData4 { s: 0 as u32 },
+            ));
+        } else {
+            registry.commands().spawn((
+                TestData1 { s: 0 as u32 },
+                TestData3 { s: 0 as u32 },
+                TestData4 { s: 0 as u32 },
+                TestData5 { s: 0 as u32 },
+            ));
+        }
     }
 
     registry.flush_commands();
-    dbg!(TestData2::id(), TestData3::id(), TestData4::id());
     let mut schedule = Schedule::new(7, &mut registry);
     schedule.add(move |query1: Query<(&mut TestData3, &mut TestData4)>| {
-        for (a, b) in query1 {
+        for (a, _b) in query1 {
             a.s += 1;
             dbg!(a);
         }
     });
-    schedule.add(move |query1: Query<(&mut TestData3, &mut TestData4), (Without<TestData2>, Superset)>| {
-        for (a, b) in query1 {
-            a.s += 1;
+    schedule.add(
+        move |query1: Query<(&mut TestData3, &mut TestData4), (Without<TestData2>,)>| {
+            for (a, _b) in query1 {
+                a.s += 1;
+                dbg!(a);
+            }
+        },
+    );
+    schedule.add(
+        move |query1: Query<
+            (&mut TestData3, &mut TestData4),
+            (With<TestData5>, Without<TestData2>),
+        >| {
+            for (a, _b) in query1 {
+                a.s += 1;
+                dbg!(a);
+            }
+        },
+    );
+    schedule.add(move |query1: Query<(&mut TestData3, &mut TestData4)>| {
+        for (a, _b) in query1 {
             dbg!(a);
         }
-
     });
 
-    bencher.iter(|| {
-        schedule.execute();
-    });
+    schedule.execute();
     drop(schedule);
-
 }
